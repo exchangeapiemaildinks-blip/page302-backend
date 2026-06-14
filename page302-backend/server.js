@@ -50,20 +50,24 @@ async function fetchFD(path) {
   return res.json();
 }
 
-// "GROUP_C" -> "C"; anything else (knockout stages) -> null
+// matches use "GROUP_C", standings use "Group C" — same tournament, two formats.
+// Both map to a bare letter "C"; anything else (knockout stages) -> null
 function groupLetter(g) {
   if (!g) return null;
-  const m = /^GROUP_([A-Z])$/.exec(g);
-  return m ? m[1] : null;
+  const m = /GROUP[_\s]?([A-Za-z])$/i.exec(g);
+  return m ? m[1].toUpperCase() : null;
 }
 
 function mapMatch(m) {
   const ft = (m.score && m.score.fullTime) || {};
+  // football-data.org has used both {home,away} and {homeTeam,awayTeam} keys
+  // depending on endpoint/competition — accept either.
+  const hs = ft.home ?? ft.homeTeam ?? 0;
+  const as = ft.away ?? ft.awayTeam ?? 0;
   return {
     home: (m.homeTeam && m.homeTeam.name || 'TBD').toUpperCase(),
     away: (m.awayTeam && m.awayTeam.name || 'TBD').toUpperCase(),
-    hs: ft.homeTeam ?? 0,
-    as: ft.awayTeam ?? 0,
+    hs, as,
     status: m.status, // SCHEDULED | TIMED | IN_PLAY | PAUSED | FINISHED
     minute: (typeof m.minute === 'number') ? m.minute : null,
     kickoff: new Date(m.utcDate).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
