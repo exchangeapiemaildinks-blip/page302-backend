@@ -30,6 +30,10 @@ if (!API_KEY) {
 // In-memory cache. Served instantly; refreshed on a timer below.
 let cache = { competition: 'WORLD CUP', subtitle: 'GROUP STAGE', matches: [], table: [] };
 
+// Debug snapshot — last raw upstream data + any errors, for diagnosing
+// mapping issues without needing to dig through host logs. See GET /debug.
+let debugInfo = { lastError: { matches: null, standings: null }, rawMatches: null, rawStandings: null, fetchedAt: null };
+
 const STAGE_LABELS = {
   GROUP_STAGE: 'GROUP STAGE',
   LAST_16: 'ROUND OF 16',
@@ -107,17 +111,34 @@ async function refresh() {
     const data = await fetchFD(`/competitions/${COMPETITION}/matches?dateFrom=${today}&dateTo=${tomorrow}`);
     matches = (data.matches || []).map(mapMatch);
     subtitle = pickSubtitle(matches);
+    debugInfo.lastError.matches = null;
+    // raw snapshot of just the bits we care about, for diagnosing score/minute mapping
+    debugInfo.rawMatches = (data.matches || []).map(m => ({
+      home: m.homeTeam && m.homeTeam.name,
+      away: m.awayTeam && m.awayTeam.name,
+      status: m.status,
+      minute: m.minute,
+      score: m.score,
+      group: m.group,
+      stage: m.stage
+    }));
   } catch (e) {
+    debugInfo.lastError.matches = e.message;
     console.error('matches refresh failed:', e.message);
   }
 
   try {
     const data = await fetchFD(`/competitions/${COMPETITION}/standings`);
     table = mapStandings(data);
+    debugInfo.lastError.standings = null;
+    debugInfo.rawStandings = data;
   } catch (e) {
     // Standings can 404 once the group stage ends — not fatal, keep last-known table.
+    debugInfo.lastError.standings = e.message;
     console.error('standings refresh failed:', e.message);
   }
+
+  debugInfo.fetchedAt = new Date().toISOString();
 
   cache = { competition: 'WORLD CUP', subtitle, matches, table };
   console.log(new Date().toISOString(), '- refreshed:', matches.length, 'matches,', table.length, 'table rows');
@@ -127,7 +148,8 @@ const app = express();
 app.use(cors()); // public read-only feed — safe to allow any origin
 
 app.get('/feed', (req, res) => res.json(cache));
-app.get('/', (req, res) => res.send('Page 302 backend is running. Try /feed'));
+app.get('/debug', (req, res) => res.json(debugInfo));
+app.get('/', (req, res) => res.send('Page 302 backend is running. Try /feed or /debug'));
 
 refresh(); // populate cache immediately on boot
 setInterval(refresh, 60_000); // football-data.org free tier allows far more than 1 req/min
