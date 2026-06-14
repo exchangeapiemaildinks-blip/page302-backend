@@ -70,7 +70,10 @@ function mapMatch(m) {
     hs, as,
     status: m.status, // SCHEDULED | TIMED | IN_PLAY | PAUSED | FINISHED
     minute: (typeof m.minute === 'number') ? m.minute : null,
-    kickoff: new Date(m.utcDate).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
+    // Raw UTC ISO timestamp - the frontend formats this in the *viewer's*
+    // local timezone. Don't pre-format here: the server's timezone (Render
+    // runs UTC) has nothing to do with the user's.
+    kickoff: m.utcDate,
     group: groupLetter(m.group),
     stage: m.stage || null,
     // football-data.org's match-list endpoint doesn't include goal scorers —
