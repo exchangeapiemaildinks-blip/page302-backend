@@ -121,6 +121,7 @@ async function refresh() {
     debugInfo.lastError.matches = null;
     // raw snapshot of just the bits we care about, for diagnosing score/minute mapping
     debugInfo.rawMatches = (data.matches || []).map(m => ({
+      id: m.id,
       home: m.homeTeam && m.homeTeam.name,
       away: m.awayTeam && m.awayTeam.name,
       status: m.status,
@@ -156,6 +157,29 @@ app.use(cors()); // public read-only feed — safe to allow any origin
 
 app.get('/feed', (req, res) => res.json(cache));
 app.get('/debug', (req, res) => res.json(debugInfo));
+
+// On-demand: fetch one match's full detail (not part of the regular 60s
+// poll, so it doesn't affect rate limits). Use this to check whether `goals`
+// (scorer + minute) is present on this API key's tier.
+//   GET /debug/match?id=<id from /debug rawMatches>
+app.get('/debug/match', async (req, res) => {
+  const id = req.query.id;
+  if (!id) return res.status(400).json({ error: 'pass ?id=<match id from /debug rawMatches>' });
+  try {
+    const data = await fetchFD(`/matches/${id}`);
+    res.json({
+      id: data.id,
+      status: data.status,
+      score: data.score,
+      goals: data.goals,
+      homeTeam: data.homeTeam && data.homeTeam.name,
+      awayTeam: data.awayTeam && data.awayTeam.name
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/', (req, res) => res.send('Page 302 backend is running. Try /feed or /debug'));
 
 refresh(); // populate cache immediately on boot
