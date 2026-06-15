@@ -30,6 +30,12 @@ if (!API_KEY) {
 // In-memory cache. Served instantly; refreshed on a timer below.
 let cache = { competition: 'WORLD CUP', subtitle: 'GROUP STAGE', matches: [], table: [], fetchedAt: null };
 
+// Per-match goal events (scorer, minute, assist), fetched on demand from
+// /matches/{id} since the list endpoint doesn't include them. Keyed by
+// match id. FINISHED matches cache forever (goals don't change); IN_PLAY/
+// PAUSED matches re-fetch every refresh to pick up new goals.
+const goalsCache = new Map();
+
 // Debug snapshot — last raw upstream data + any errors, for diagnosing
 // mapping issues without needing to dig through host logs. See GET /debug.
 let debugInfo = { lastError: { matches: null, standings: null }, rawMatches: null, rawStandings: null, fetchedAt: null };
@@ -58,12 +64,70 @@ function groupLetter(g) {
   return m ? m[1].toUpperCase() : null;
 }
 
+// Goals only need fetching for matches that have actually started, and only
+// for a recent window - the dataset now spans the whole tournament, and we
+// don't want the first refresh after deploy to fire ~20+ goal-detail
+// requests for long-finished matches nobody's looking at. 48h covers
+// "today/yesterday" for any timezone; live matches are always included
+// regardless of age (covers a match running past midnight).
+const GOALS_WINDOW_MS = 48 * 60 * 60 * 1000;
+function needsGoals(m) {
+  if (m.status === 'IN_PLAY' || m.status === 'PAUSED') return true;
+  if (m.status !== 'FINISHED') return false;
+  return (Date.now() - new Date(m.utcDate).getTime()) < GOALS_WINDOW_MS;
+}
+
+// "SURNAME 90" / "SURNAME 90+6" / "SURNAME 67 PEN" / "SURNAME 23 OG" -
+// matches the mock data's "MCTOMINAY 57" style. Surname = last word of the
+// scorer's full name (an approximation - misses multi-word surnames like
+// "van Dijk", but fits the compact teletext format much better than full names).
+function formatScorer(goal) {
+  const name = (goal.scorer && goal.scorer.name) || '';
+  const surname = name.trim().split(/\s+/).pop().toUpperCase();
+  let label = surname + ' ' + goal.minute;
+  if (goal.injuryTime) label += '+' + goal.injuryTime;
+  if (goal.type === 'PENALTY') label += ' PEN';
+  else if (goal.type === 'OWN') label += ' OG';
+  return label;
+}
+
+// Populates goalsCache for matches that need it. FINISHED matches are
+// fetched once and cached forever; IN_PLAY/PAUSED matches re-fetch every
+// refresh cycle to pick up new goals.
+async function populateGoalsCache(rawMatches) {
+  for (const m of rawMatches) {
+    if (!needsGoals(m)) continue;
+    const isLive = m.status === 'IN_PLAY' || m.status === 'PAUSED';
+    if (!isLive && goalsCache.has(m.id)) continue;
+    try {
+      const detail = await fetchFD(`/matches/${m.id}`);
+      goalsCache.set(m.id, detail.goals || []);
+    } catch (e) {
+      if (!goalsCache.has(m.id)) goalsCache.set(m.id, []);
+      console.error('goals fetch failed for match', m.id, ':', e.message);
+    }
+  }
+}
+
+
 function mapMatch(m) {
   const ft = (m.score && m.score.fullTime) || {};
   // football-data.org has used both {home,away} and {homeTeam,awayTeam} keys
   // depending on endpoint/competition — accept either.
   const hs = ft.home ?? ft.homeTeam ?? 0;
   const as = ft.away ?? ft.awayTeam ?? 0;
+
+  const homeId = m.homeTeam && m.homeTeam.id;
+  const awayId = m.awayTeam && m.awayTeam.id;
+  const goals = goalsCache.get(m.id) || [];
+  const scorersHome = [], scorersAway = [];
+  for (const g of goals) {
+    if (!g.team) continue;
+    const label = formatScorer(g);
+    if (g.team.id === homeId) scorersHome.push(label);
+    else if (g.team.id === awayId) scorersAway.push(label);
+  }
+
   return {
     home: (m.homeTeam && m.homeTeam.name || 'TBD').toUpperCase(),
     away: (m.awayTeam && m.awayTeam.name || 'TBD').toUpperCase(),
@@ -76,9 +140,7 @@ function mapMatch(m) {
     kickoff: m.utcDate,
     group: groupLetter(m.group),
     stage: m.stage || null,
-    // football-data.org's match-list endpoint doesn't include goal scorers —
-    // the app already renders an empty scorer list gracefully.
-    scorers: { home: [], away: [] }
+    scorers: { home: scorersHome, away: scorersAway }
   };
 }
 
@@ -117,6 +179,7 @@ async function refresh() {
     // server-side "today" filter can't do that correctly across timezones
     // (a 23:00 UTC kickoff is already "tomorrow" in BST).
     const data = await fetchFD(`/competitions/${COMPETITION}/matches`);
+    await populateGoalsCache(data.matches || []);
     matches = (data.matches || []).map(mapMatch);
     subtitle = pickSubtitle(matches);
     fetchedAt = new Date().toISOString();
