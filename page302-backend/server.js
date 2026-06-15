@@ -28,7 +28,7 @@ if (!API_KEY) {
 }
 
 // In-memory cache. Served instantly; refreshed on a timer below.
-let cache = { competition: 'WORLD CUP', subtitle: 'GROUP STAGE', matches: [], table: [] };
+let cache = { competition: 'WORLD CUP', subtitle: 'GROUP STAGE', matches: [], table: [], fetchedAt: null };
 
 // Debug snapshot — last raw upstream data + any errors, for diagnosing
 // mapping issues without needing to dig through host logs. See GET /debug.
@@ -108,7 +108,7 @@ function pickSubtitle(matches) {
 }
 
 async function refresh() {
-  let matches = cache.matches, table = cache.table, subtitle = cache.subtitle;
+  let matches = cache.matches, table = cache.table, subtitle = cache.subtitle, fetchedAt = cache.fetchedAt;
 
   try {
     // No date filter: fetch the whole competition's matches (one season,
@@ -119,6 +119,7 @@ async function refresh() {
     const data = await fetchFD(`/competitions/${COMPETITION}/matches`);
     matches = (data.matches || []).map(mapMatch);
     subtitle = pickSubtitle(matches);
+    fetchedAt = new Date().toISOString();
     debugInfo.lastError.matches = null;
     // raw snapshot of just the bits we care about, for diagnosing score/minute mapping
     debugInfo.rawMatches = (data.matches || []).map(m => ({
@@ -149,7 +150,7 @@ async function refresh() {
 
   debugInfo.fetchedAt = new Date().toISOString();
 
-  cache = { competition: 'WORLD CUP', subtitle, matches, table };
+  cache = { competition: 'WORLD CUP', subtitle, matches, table, fetchedAt };
   console.log(new Date().toISOString(), '- refreshed:', matches.length, 'matches,', table.length, 'table rows');
 }
 
