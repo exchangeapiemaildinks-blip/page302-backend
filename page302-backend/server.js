@@ -124,8 +124,16 @@ function mapMatch(m) {
   for (const g of goals) {
     if (!g.team) continue;
     const label = formatScorer(g);
-    if (g.team.id === homeId) scorersHome.push(label);
-    else if (g.team.id === awayId) scorersAway.push(label);
+    // goal.team is always the SCORER's own team. For a regular/penalty goal
+    // that's also the team it counts for - but an own goal counts for the
+    // OPPONENT, so flip which column it lands in.
+    let creditId = g.team.id;
+    if (g.type === 'OWN') {
+      if (creditId === homeId) creditId = awayId;
+      else if (creditId === awayId) creditId = homeId;
+    }
+    if (creditId === homeId) scorersHome.push(label);
+    else if (creditId === awayId) scorersAway.push(label);
   }
 
   return {
