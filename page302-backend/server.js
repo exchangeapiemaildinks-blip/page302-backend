@@ -133,6 +133,8 @@ function formatScorer(goal) {
 // Populates goalsCache and lineupCache for matches that need it.
 // FINISHED matches are fetched once and cached forever; IN_PLAY/PAUSED
 // matches re-fetch every refresh cycle to pick up new goals/subs.
+// TIMED matches re-fetch if their cached lineup is still empty (lineups
+// drop ~1hr before kickoff so an earlier empty cache hit must be retried).
 async function populateGoalsCache(rawMatches) {
   for (const m of rawMatches) {
     const wantsGoals = needsGoals(m);
@@ -140,17 +142,31 @@ async function populateGoalsCache(rawMatches) {
     if (!wantsGoals && !wantsLineup) continue;
 
     const isLive = m.status === 'IN_PLAY' || m.status === 'PAUSED';
-    // Skip if already cached and not live (goals won't change, lineup won't change)
-    if (!isLive && goalsCache.has(m.id) && lineupCache.has(m.id)) continue;
-    if (!isLive && !wantsGoals && lineupCache.has(m.id)) continue;
+    const isTimed = m.status === 'TIMED' || m.status === 'SCHEDULED';
+
+    // For TIMED matches, re-fetch if cached lineup is empty (lineups may have
+    // dropped since last check). For finished/live, skip if fully cached.
+    const cachedLineup = lineupCache.get(m.id);
+    const lineupIsEmpty = !cachedLineup || !cachedLineup.home || !cachedLineup.home.lineup || cachedLineup.home.lineup.length === 0;
+
+    if (!isLive && !isTimed && goalsCache.has(m.id) && !lineupIsEmpty) continue;
+    if (!isLive && isTimed && !wantsGoals && !lineupIsEmpty) continue;
 
     try {
       const detail = await fetchFD(`/matches/${m.id}`);
       if (wantsGoals) goalsCache.set(m.id, detail.goals || []);
-      // Always extract lineup from the same call if data is present
       const home = extractLineup(detail.homeTeam);
       const away = extractLineup(detail.awayTeam);
-      if (home && away) lineupCache.set(m.id, { home, away });
+      // Only cache lineup if it's actually populated — don't overwrite a
+      // populated cache with an empty one, and don't cache empty lineups
+      // for TIMED matches (we'll retry next cycle until they drop).
+      const homeHasPlayers = home && home.lineup && home.lineup.length > 0;
+      if (homeHasPlayers) {
+        lineupCache.set(m.id, { home, away });
+      } else if (!isTimed) {
+        // For non-TIMED matches with no lineup, cache empty so we don't keep retrying
+        if (!lineupCache.has(m.id)) lineupCache.set(m.id, { home, away });
+      }
     } catch (e) {
       if (!goalsCache.has(m.id)) goalsCache.set(m.id, []);
       console.error('detail fetch failed for match', m.id, ':', e.message);
