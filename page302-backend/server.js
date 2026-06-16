@@ -51,7 +51,13 @@ const STAGE_LABELS = {
 };
 
 async function fetchFD(path) {
-  const res = await fetch(BASE + path, { headers: { 'X-Auth-Token': API_KEY || '' } });
+  const res = await fetch(BASE + path, { headers: {
+    'X-Auth-Token': API_KEY || '',
+    'X-Unfold-Goals': 'true',
+    'X-Unfold-Lineups': 'true',
+    'X-Unfold-Bookings': 'true',
+    'X-Unfold-Subs': 'true',
+  }});
   if (!res.ok) throw new Error(path + ' -> HTTP ' + res.status);
   return res.json();
 }
@@ -247,6 +253,36 @@ app.get('/debug/match', async (req, res) => {
       goals: data.goals,
       homeTeam: data.homeTeam && data.homeTeam.name,
       awayTeam: data.awayTeam && data.awayTeam.name
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// On-demand: fetch one match's lineup/formation data to verify shape.
+//   GET /debug/lineup?id=<match id>
+app.get('/debug/lineup', async (req, res) => {
+  const id = req.query.id;
+  if (!id) return res.status(400).json({ error: 'pass ?id=<match id>' });
+  try {
+    const data = await fetchFD(`/matches/${id}`);
+    res.json({
+      id: data.id,
+      status: data.status,
+      homeTeam: {
+        name: data.homeTeam && data.homeTeam.name,
+        formation: data.homeTeam && data.homeTeam.formation,
+        lineup: data.homeTeam && data.homeTeam.lineup,
+        bench: data.homeTeam && data.homeTeam.bench,
+        coach: data.homeTeam && data.homeTeam.coach,
+      },
+      awayTeam: {
+        name: data.awayTeam && data.awayTeam.name,
+        formation: data.awayTeam && data.awayTeam.formation,
+        lineup: data.awayTeam && data.awayTeam.lineup,
+        bench: data.awayTeam && data.awayTeam.bench,
+        coach: data.awayTeam && data.awayTeam.coach,
+      }
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
