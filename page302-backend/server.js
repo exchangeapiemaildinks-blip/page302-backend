@@ -70,6 +70,10 @@ function groupLetter(g) {
   return m ? m[1].toUpperCase() : null;
 }
 
+// Per-match lineup data, from the same /matches/{id} detail call as goals.
+// Keyed by match id. Stores { home, away } each with { formation, lineup, bench, coach }.
+const lineupCache = new Map();
+
 // Goals only need fetching for matches that have actually started, and only
 // for a recent window - the dataset now spans the whole tournament, and we
 // don't want the first refresh after deploy to fire ~20+ goal-detail
@@ -81,6 +85,35 @@ function needsGoals(m) {
   if (m.status === 'IN_PLAY' || m.status === 'PAUSED') return true;
   if (m.status !== 'FINISHED') return false;
   return (Date.now() - new Date(m.utcDate).getTime()) < GOALS_WINDOW_MS;
+}
+
+// Lineups drop ~1hr before kickoff. Fetch for any upcoming match within
+// 2hrs of kickoff, plus all started matches (they'll already be fetched
+// for goals — this just also extracts the lineup from the same call).
+const LINEUP_WINDOW_MS = 2 * 60 * 60 * 1000;
+function needsLineup(m) {
+  if (lineupCache.has(m.id) && m.status === 'FINISHED') return false; // cache forever when done
+  if (m.status === 'IN_PLAY' || m.status === 'PAUSED' || m.status === 'FINISHED') return true;
+  if (m.status !== 'TIMED' && m.status !== 'SCHEDULED') return false;
+  return (new Date(m.utcDate).getTime() - Date.now()) < LINEUP_WINDOW_MS;
+}
+
+function extractLineup(teamData) {
+  if (!teamData) return null;
+  return {
+    formation: teamData.formation || null,
+    lineup: (teamData.lineup || []).map(p => ({
+      shirt: p.shirtNumber,
+      name: p.name,
+      pos: p.position,
+    })),
+    bench: (teamData.bench || []).map(p => ({
+      shirt: p.shirtNumber,
+      name: p.name,
+      pos: p.position,
+    })),
+    coach: (teamData.coach && teamData.coach.name) || null,
+  };
 }
 
 // "SURNAME 90" / "SURNAME 90+6" / "SURNAME 67 PEN" / "SURNAME 23 OG" -
@@ -97,20 +130,30 @@ function formatScorer(goal) {
   return label;
 }
 
-// Populates goalsCache for matches that need it. FINISHED matches are
-// fetched once and cached forever; IN_PLAY/PAUSED matches re-fetch every
-// refresh cycle to pick up new goals.
+// Populates goalsCache and lineupCache for matches that need it.
+// FINISHED matches are fetched once and cached forever; IN_PLAY/PAUSED
+// matches re-fetch every refresh cycle to pick up new goals/subs.
 async function populateGoalsCache(rawMatches) {
   for (const m of rawMatches) {
-    if (!needsGoals(m)) continue;
+    const wantsGoals = needsGoals(m);
+    const wantsLineup = needsLineup(m);
+    if (!wantsGoals && !wantsLineup) continue;
+
     const isLive = m.status === 'IN_PLAY' || m.status === 'PAUSED';
-    if (!isLive && goalsCache.has(m.id)) continue;
+    // Skip if already cached and not live (goals won't change, lineup won't change)
+    if (!isLive && goalsCache.has(m.id) && lineupCache.has(m.id)) continue;
+    if (!isLive && !wantsGoals && lineupCache.has(m.id)) continue;
+
     try {
       const detail = await fetchFD(`/matches/${m.id}`);
-      goalsCache.set(m.id, detail.goals || []);
+      if (wantsGoals) goalsCache.set(m.id, detail.goals || []);
+      // Always extract lineup from the same call if data is present
+      const home = extractLineup(detail.homeTeam);
+      const away = extractLineup(detail.awayTeam);
+      if (home && away) lineupCache.set(m.id, { home, away });
     } catch (e) {
       if (!goalsCache.has(m.id)) goalsCache.set(m.id, []);
-      console.error('goals fetch failed for match', m.id, ':', e.message);
+      console.error('detail fetch failed for match', m.id, ':', e.message);
     }
   }
 }
@@ -142,19 +185,19 @@ function mapMatch(m) {
     else if (creditId === awayId) scorersAway.push(label);
   }
 
+  const lineups = lineupCache.get(m.id) || null;
+
   return {
     home: (m.homeTeam && m.homeTeam.name || 'TBD').toUpperCase(),
     away: (m.awayTeam && m.awayTeam.name || 'TBD').toUpperCase(),
     hs, as,
-    status: m.status, // SCHEDULED | TIMED | IN_PLAY | PAUSED | FINISHED
+    status: m.status,
     minute: (typeof m.minute === 'number') ? m.minute : null,
-    // Raw UTC ISO timestamp - the frontend formats this in the *viewer's*
-    // local timezone. Don't pre-format here: the server's timezone (Render
-    // runs UTC) has nothing to do with the user's.
     kickoff: m.utcDate,
     group: groupLetter(m.group),
     stage: m.stage || null,
-    scorers: { home: scorersHome, away: scorersAway }
+    scorers: { home: scorersHome, away: scorersAway },
+    lineups,
   };
 }
 
