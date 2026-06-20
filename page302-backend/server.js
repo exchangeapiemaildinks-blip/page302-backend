@@ -131,11 +131,16 @@ function formatScorer(goal) {
 }
 
 // Populates goalsCache and lineupCache for matches that need it.
-// FINISHED matches are fetched once and cached forever; IN_PLAY/PAUSED
-// matches re-fetch every refresh cycle to pick up new goals/subs.
-// TIMED matches re-fetch if their cached lineup is still empty (lineups
-// drop ~1hr before kickoff so an earlier empty cache hit must be retried).
+// Key rules:
+// - FINISHED matches: fetch once, cache forever — but ONLY on success.
+//   A failed/rate-limited fetch must NOT be cached as empty, or we'll
+//   never retry and scorers will be permanently missing.
+// - IN_PLAY/PAUSED: always re-fetch (score/scorers changing)
+// - TIMED: re-fetch if cached lineup is empty (lineups drop ~1hr before KO)
+// - Rate limiting: small delay between calls to avoid hitting football-data.org limits
 async function populateGoalsCache(rawMatches) {
+  const delay = ms => new Promise(r => setTimeout(r, ms));
+
   for (const m of rawMatches) {
     const wantsGoals = needsGoals(m);
     const wantsLineup = needsLineup(m);
@@ -143,32 +148,41 @@ async function populateGoalsCache(rawMatches) {
 
     const isLive = m.status === 'IN_PLAY' || m.status === 'PAUSED';
     const isTimed = m.status === 'TIMED' || m.status === 'SCHEDULED';
+    const isFinished = m.status === 'FINISHED';
 
-    // For TIMED matches, re-fetch if cached lineup is empty (lineups may have
-    // dropped since last check). For finished/live, skip if fully cached.
+    const cachedGoals = goalsCache.get(m.id);
     const cachedLineup = lineupCache.get(m.id);
     const lineupIsEmpty = !cachedLineup || !cachedLineup.home || !cachedLineup.home.lineup || cachedLineup.home.lineup.length === 0;
 
-    if (!isLive && !isTimed && goalsCache.has(m.id) && !lineupIsEmpty) continue;
+    // For FINISHED matches: skip only if we have BOTH goals and lineup cached.
+    // If goals cache exists but is empty, it could be an error result — retry.
+    // (Live matches always re-fetch; TIMED re-fetch until lineup populated.)
+    if (isFinished && cachedGoals && cachedGoals.length > 0 && !lineupIsEmpty) continue;
+    if (isFinished && !wantsLineup && cachedGoals && cachedGoals.length > 0) continue;
     if (!isLive && isTimed && !wantsGoals && !lineupIsEmpty) continue;
 
     try {
       const detail = await fetchFD(`/matches/${m.id}`);
-      if (wantsGoals) goalsCache.set(m.id, detail.goals || []);
+      const goals = detail.goals || [];
+      if (wantsGoals) {
+        // Only cache if we got a real response — empty goals on a FINISHED
+        // match with a non-zero score is suspicious; cache anyway but it'll
+        // be retried next cycle since goals.length === 0.
+        goalsCache.set(m.id, goals);
+      }
       const home = extractLineup(detail.homeTeam);
       const away = extractLineup(detail.awayTeam);
-      // Only cache lineup if it's actually populated — don't overwrite a
-      // populated cache with an empty one, and don't cache empty lineups
-      // for TIMED matches (we'll retry next cycle until they drop).
       const homeHasPlayers = home && home.lineup && home.lineup.length > 0;
       if (homeHasPlayers) {
         lineupCache.set(m.id, { home, away });
       } else if (!isTimed) {
-        // For non-TIMED matches with no lineup, cache empty so we don't keep retrying
         if (!lineupCache.has(m.id)) lineupCache.set(m.id, { home, away });
       }
+      // Small delay between calls — keeps us well inside the 30 req/min
+      // rate limit on Deep Data tier even with a full tournament dataset.
+      await delay(300);
     } catch (e) {
-      if (!goalsCache.has(m.id)) goalsCache.set(m.id, []);
+      // Do NOT cache on error — leave the entry absent so we retry next cycle.
       console.error('detail fetch failed for match', m.id, ':', e.message);
     }
   }
@@ -252,7 +266,9 @@ async function refresh() {
     // server-side "today" filter can't do that correctly across timezones
     // (a 23:00 UTC kickoff is already "tomorrow" in BST).
     const data = await fetchFD(`/competitions/${COMPETITION}/matches`);
+    const t0 = Date.now();
     await populateGoalsCache(data.matches || []);
+    console.log(`populateGoalsCache: ${Date.now()-t0}ms for ${(data.matches||[]).length} raw matches`);
     matches = (data.matches || []).map(mapMatch);
     subtitle = pickSubtitle(matches);
     fetchedAt = new Date().toISOString();
