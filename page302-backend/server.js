@@ -288,12 +288,34 @@ async function refresh() {
 
   cache = { competition: 'WORLD CUP', subtitle, matches, table, fetchedAt };
   console.log(new Date().toISOString(), '- refreshed:', matches.length, 'matches,', table.length, 'table rows');
+  if (!firstRefreshDone) resolvePendingFeed();
 }
 
 const app = express();
 app.use(cors()); // public read-only feed — safe to allow any origin
 
-app.get('/feed', (req, res) => res.json(cache));
+// Block /feed until the first refresh() has fully completed (including
+// populateGoalsCache). Without this, a frontend request that lands during
+// Render's boot gets an empty cache — matches with no scorers/lineups.
+let firstRefreshDone = false;
+const pendingFeedRequests = [];
+
+function resolvePendingFeed() {
+  firstRefreshDone = true;
+  pendingFeedRequests.forEach(({ res }) => res.json(cache));
+  pendingFeedRequests.length = 0;
+}
+
+app.get('/feed', (req, res) => {
+  if (firstRefreshDone) return res.json(cache);
+  // First refresh still in flight — hold the request (max 45s, then serve
+  // whatever partial cache we have rather than letting it hang forever).
+  const timeout = setTimeout(() => {
+    const idx = pendingFeedRequests.findIndex(r => r.res === res);
+    if (idx !== -1) { pendingFeedRequests.splice(idx, 1); res.json(cache); }
+  }, 45000);
+  pendingFeedRequests.push({ res, timeout });
+});
 app.get('/debug', (req, res) => res.json(debugInfo));
 
 // On-demand: fetch one match's full detail (not part of the regular 60s
