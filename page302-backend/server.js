@@ -50,16 +50,60 @@ const STAGE_LABELS = {
   FINAL: 'FINAL'
 };
 
+// Fixed bracket slot descriptions keyed by football-data.org match ID.
+// Mapped by cross-referencing utcDate from /debug/knockout against the
+// published FIFA bracket. Used as fallback when home/away are still null.
+// Once the API populates real team names, those take precedence.
+const BRACKET = {
+  // Round of 32
+  537417: { home: 'Runner-up A',  away: 'Runner-up B' },
+  537423: { home: 'Winner E',     away: 'Best 3rd (A/B/C/D/F)' },
+  537415: { home: 'Winner F',     away: 'Runner-up C' },
+  537418: { home: 'Winner C',     away: 'Runner-up F' },
+  537424: { home: 'Winner I',     away: 'Best 3rd (C/D/F/G/H)' },
+  537416: { home: 'Runner-up E',  away: 'Runner-up I' },
+  537425: { home: 'Winner A',     away: 'Best 3rd (C/E/F/H/I)' },
+  537426: { home: 'Winner L',     away: 'Best 3rd (E/H/I/J/K)' },
+  537422: { home: 'Winner D',     away: 'Best 3rd (B/E/F/I/J)' },
+  537421: { home: 'Winner G',     away: 'Best 3rd (A/E/H/I/J)' },
+  537420: { home: 'Runner-up K',  away: 'Runner-up L' },
+  537419: { home: 'Winner H',     away: 'Runner-up J' },
+  537429: { home: 'Winner B',     away: 'Best 3rd (E/F/G/I/J)' },
+  537428: { home: 'Winner J',     away: 'Runner-up H' },
+  537427: { home: 'Winner K',     away: 'Best 3rd (D/E/I/J/L)' },
+  537430: { home: 'Runner-up D',  away: 'Runner-up G' },
+  // Round of 16 (winners of R32 matches, in bracket order)
+  537376: { home: 'Winner M74',   away: 'Winner M77' },
+  537375: { home: 'Winner M73',   away: 'Winner M75' },
+  537377: { home: 'Winner M76',   away: 'Winner M78' },
+  537378: { home: 'Winner M79',   away: 'Winner M80' },
+  537379: { home: 'Winner M83',   away: 'Winner M84' },
+  537380: { home: 'Winner M81',   away: 'Winner M82' },
+  537381: { home: 'Winner M85',   away: 'Winner M87' },
+  537382: { home: 'Winner M86',   away: 'Winner M88' },
+  // Quarter-finals
+  537383: { home: 'QF1: R16 winners', away: 'QF1: R16 winners' },
+  537384: { home: 'QF2: R16 winners', away: 'QF2: R16 winners' },
+  537385: { home: 'QF3: R16 winners', away: 'QF3: R16 winners' },
+  537386: { home: 'QF4: R16 winners', away: 'QF4: R16 winners' },
+  // Semi-finals
+  537387: { home: 'SF1: QF winners',  away: 'SF1: QF winners' },
+  537388: { home: 'SF2: QF winners',  away: 'SF2: QF winners' },
+  // Third place & Final
+  537389: { home: 'Semi-final losers', away: 'Semi-final losers' },
+  537390: { home: 'SF1 winner',        away: 'SF2 winner' },
+};
+
 async function fetchFD(path) {
-  const res = await fetch(BASE + path, { headers: {
+  const apiRes = await fetch(BASE + path, { headers: {
     'X-Auth-Token': API_KEY || '',
     'X-Unfold-Goals': 'true',
     'X-Unfold-Lineups': 'true',
     'X-Unfold-Bookings': 'true',
     'X-Unfold-Subs': 'true',
   }});
-  if (!res.ok) throw new Error(path + ' -> HTTP ' + res.status);
-  return res.json();
+  if (!apiRes.ok) throw new Error(path + ' -> HTTP ' + apiRes.status);
+  return apiRes.json();
 }
 
 // matches use "GROUP_C", standings use "Group C" — same tournament, two formats.
@@ -217,9 +261,13 @@ function mapMatch(m) {
 
   const lineups = lineupCache.get(m.id) || null;
 
+  const bracket = BRACKET[m.id];
+  const homeName = (m.homeTeam && m.homeTeam.name) || (bracket && bracket.home) || 'TBD';
+  const awayName = (m.awayTeam && m.awayTeam.name) || (bracket && bracket.away) || 'TBD';
+
   return {
-    home: (m.homeTeam && m.homeTeam.name || 'TBD').toUpperCase(),
-    away: (m.awayTeam && m.awayTeam.name || 'TBD').toUpperCase(),
+    home: homeName.toUpperCase(),
+    away: awayName.toUpperCase(),
     hs, as,
     status: m.status,
     minute: (typeof m.minute === 'number') ? m.minute : null,
