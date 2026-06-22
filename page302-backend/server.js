@@ -282,7 +282,8 @@ async function refresh() {
       minute: m.minute,
       score: m.score,
       group: m.group,
-      stage: m.stage
+      stage: m.stage,
+      utcDate: m.utcDate
     }));
   } catch (e) {
     debugInfo.lastError.matches = e.message;
@@ -339,17 +340,21 @@ app.get('/debug', (req, res) => res.json(debugInfo));
 // known FIFA bracket slots by cross-referencing kickoff dates/times.
 app.get('/debug/knockout', (req, res) => {
   const knockoutStages = ['LAST_32','LAST_16','QUARTER_FINALS','SEMI_FINALS','THIRD_PLACE','FINAL'];
-  const matches = (debugInfo.rawMatches || [])
+  const raw = debugInfo.rawMatches || [];
+  const matches = raw
     .filter(m => knockoutStages.includes(m.stage))
     .map(m => ({
       id: m.id,
       stage: m.stage,
-      utcDate: m.utcDate,
-      home: m.homeTeam && m.homeTeam.name,
-      away: m.awayTeam && m.awayTeam.name,
+      utcDate: m.utcDate || null,
+      home: (m.homeTeam && m.homeTeam.name) || null,
+      away: (m.awayTeam && m.awayTeam.name) || null,
       status: m.status
     }))
-    .sort((a,b) => new Date(a.utcDate) - new Date(b.utcDate));
+    .sort((a,b) => {
+      if(a.utcDate && b.utcDate) return new Date(a.utcDate) - new Date(b.utcDate);
+      return a.id - b.id;
+    });
   res.json(matches);
 });
 
