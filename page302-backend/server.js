@@ -334,6 +334,25 @@ app.get('/feed', (req, res) => {
 });
 app.get('/debug', (req, res) => res.json(debugInfo));
 
+// Returns all knockout fixtures (LAST_32, LAST_16, QUARTER_FINALS etc) with
+// their IDs and utcDate — lets us map football-data.org match IDs to the
+// known FIFA bracket slots by cross-referencing kickoff dates/times.
+app.get('/debug/knockout', (req, res) => {
+  const knockoutStages = ['LAST_32','LAST_16','QUARTER_FINALS','SEMI_FINALS','THIRD_PLACE','FINAL'];
+  const matches = (debugInfo.rawMatches || [])
+    .filter(m => knockoutStages.includes(m.stage))
+    .map(m => ({
+      id: m.id,
+      stage: m.stage,
+      utcDate: m.utcDate,
+      home: m.homeTeam && m.homeTeam.name,
+      away: m.awayTeam && m.awayTeam.name,
+      status: m.status
+    }))
+    .sort((a,b) => new Date(a.utcDate) - new Date(b.utcDate));
+  res.json(matches);
+});
+
 // On-demand: fetch one match's full detail (not part of the regular 60s
 // poll, so it doesn't affect rate limits). Use this to check whether `goals`
 // (scorer + minute) is present on this API key's tier.
