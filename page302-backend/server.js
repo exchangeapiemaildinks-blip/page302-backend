@@ -391,15 +391,24 @@ app.get('/debug/lineup', async (req, res) => {
 
 app.get('/', (req, res) => res.send('Page 302 backend. Try /feed?comp=ELC or /competitions'));
 
-// Temporarily shows whether the API key is present and its first/last chars
-// so we can verify env vars are loading correctly without exposing the full key.
-app.get('/debug/key', (req, res) => {
+// Raw API test — calls football-data.org directly and returns the full response
+// including headers, to diagnose 403 issues.
+app.get('/debug/apitest', async (req, res) => {
   const key = process.env.FOOTBALL_DATA_API_KEY || '';
-  res.json({
-    present: !!key,
-    length: key.length,
-    preview: key ? key.slice(0,4) + '...' + key.slice(-4) : 'MISSING'
-  });
+  try {
+    const apiRes = await fetch('https://api.football-data.org/v4/competitions/ELC/matches?limit=1', {
+      headers: { 'X-Auth-Token': key }
+    });
+    const body = await apiRes.text();
+    res.json({
+      status: apiRes.status,
+      statusText: apiRes.statusText,
+      headers: Object.fromEntries(apiRes.headers.entries()),
+      body: body.slice(0, 500)
+    });
+  } catch(e) {
+    res.json({ error: e.message });
+  }
 });
 
 refreshAll();
