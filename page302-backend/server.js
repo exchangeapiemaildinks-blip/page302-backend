@@ -391,6 +391,17 @@ app.get('/debug/lineup', async (req, res) => {
 
 app.get('/', (req, res) => res.send('Page 302 backend. Try /feed?comp=ELC or /competitions'));
 
+// Temporarily shows whether the API key is present and its first/last chars
+// so we can verify env vars are loading correctly without exposing the full key.
+app.get('/debug/key', (req, res) => {
+  const key = process.env.FOOTBALL_DATA_API_KEY || '';
+  res.json({
+    present: !!key,
+    length: key.length,
+    preview: key ? key.slice(0,4) + '...' + key.slice(-4) : 'MISSING'
+  });
+});
+
 refreshAll();
 setInterval(refreshAll, 60_000);
 
