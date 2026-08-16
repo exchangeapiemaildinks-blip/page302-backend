@@ -1,18 +1,14 @@
 // Page 302 backend
 // -----------------------------------------------------------------------------
-// Small always-on service that polls football-data.org for World Cup 2026
-// matches + standings, reshapes them into the { competition, subtitle, matches,
-// table } shape the PWA's data.js expects, and serves it from GET /feed.
+// Polls football-data.org for match data across multiple competitions,
+// serves each via GET /feed?comp=ELC (or WC, PL, etc).
+// Each competition gets its own in-memory cache; goals/lineup caches are
+// shared (match IDs are globally unique across competitions).
 //
-// Why a backend at all (vs calling football-data.org from the browser):
-//   - football-data.org blocks browser (CORS) requests
-//   - it would expose your API key to anyone who views page source
-//   - caching here means N users = same 2 requests/min upstream, not N x 2
-//
-// Env vars (see .env.example):
-//   FOOTBALL_DATA_API_KEY  - required, from football-data.org
-//   COMPETITION_CODE       - default 'WC' (World Cup)
-//   PORT                   - default 3000 (Render/Railway set this for you)
+// Env vars:
+//   FOOTBALL_DATA_API_KEY  - required
+//   DEFAULT_COMP           - default competition code if ?comp omitted (default: ELC)
+//   PORT                   - default 3000
 // -----------------------------------------------------------------------------
 
 import express from 'express';
@@ -20,42 +16,135 @@ import cors from 'cors';
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.FOOTBALL_DATA_API_KEY;
-const COMPETITION = process.env.COMPETITION_CODE || 'WC';
+const DEFAULT_COMP = process.env.DEFAULT_COMP || 'ELC';
 const BASE = 'https://api.football-data.org/v4';
 
 if (!API_KEY) {
-  console.error('Missing FOOTBALL_DATA_API_KEY env var. Get one free at https://www.football-data.org/client/register');
+  console.error('Missing FOOTBALL_DATA_API_KEY env var.');
 }
 
-// In-memory cache. Served instantly; refreshed on a timer below.
-let cache = { competition: 'WORLD CUP', subtitle: 'GROUP STAGE', matches: [], table: [], fetchedAt: null };
-
-// Per-match goal events (scorer, minute, assist), fetched on demand from
-// /matches/{id} since the list endpoint doesn't include them. Keyed by
-// match id. FINISHED matches cache forever (goals don't change); IN_PLAY/
-// PAUSED matches re-fetch every refresh to pick up new goals.
-const goalsCache = new Map();
-
-// Debug snapshot — last raw upstream data + any errors, for diagnosing
-// mapping issues without needing to dig through host logs. See GET /debug.
-let debugInfo = { lastError: { matches: null, standings: null }, rawMatches: null, rawStandings: null, fetchedAt: null };
-
-const STAGE_LABELS = {
-  GROUP_STAGE: 'GROUP STAGE',
-  LAST_16: 'ROUND OF 16',
-  LAST_32: 'ROUND OF 32',
-  QUARTER_FINALS: 'QUARTER-FINALS',
-  SEMI_FINALS: 'SEMI-FINALS',
-  THIRD_PLACE: 'THIRD PLACE PLAY-OFF',
-  FINAL: 'FINAL'
+// ---- Competition config ------------------------------------------------------
+// All supported competitions. Add more here as needed.
+const COMPETITIONS = {
+  ELC: { name: 'CHAMPIONSHIP',    label: 'CHAMPIONSHIP',    type: 'league'      },
+  PL:  { name: 'PREMIER LEAGUE',  label: 'PREMIER LEAGUE',  type: 'league'      },
+  WC:  { name: 'WORLD CUP',       label: 'WORLD CUP',       type: 'tournament'  },
+  CL:  { name: 'CHAMPIONS LEAGUE',label: 'CHAMPIONS LEAGUE',type: 'league'      },
+  EC:  { name: 'EUROS',           label: 'EUROS',            type: 'tournament'  },
 };
 
-// Fixed bracket slot descriptions keyed by football-data.org match ID.
-// Mapped by cross-referencing utcDate from /debug/knockout against the
-// published FIFA bracket. Used as fallback when home/away are still null.
-// Once the API populates real team names, those take precedence.
+// ---- Per-competition cache ---------------------------------------------------
+// Each competition gets its own cache entry. Keyed by competition code.
+const compCache = {};
+const compFirstDone = {};
+const compPending = {};
+
+function initCompCache(code) {
+  const cfg = COMPETITIONS[code] || { name: code, label: code, type: 'league' };
+  compCache[code] = { competition: cfg.name, subtitle: cfg.label, matches: [], table: [], fetchedAt: null };
+  compFirstDone[code] = false;
+  compPending[code] = [];
+}
+
+Object.keys(COMPETITIONS).forEach(initCompCache);
+
+// ---- Shared goals/lineup cache (match IDs are globally unique) --------------
+const goalsCache = new Map();
+const lineupCache = new Map();
+
+let debugInfo = { lastError: {}, rawMatches: {}, fetchedAt: null };
+
+// ---- API helper -------------------------------------------------------------
+async function fetchFD(path) {
+  const apiRes = await fetch(BASE + path, { headers: {
+    'X-Auth-Token': API_KEY || '',
+    'X-Unfold-Goals': 'true',
+    'X-Unfold-Lineups': 'true',
+    'X-Unfold-Bookings': 'true',
+    'X-Unfold-Subs': 'true',
+  }});
+  if (!apiRes.ok) throw new Error(path + ' -> HTTP ' + apiRes.status);
+  return apiRes.json();
+}
+
+// ---- Scorer formatting ------------------------------------------------------
+function formatScorer(goal) {
+  const name = (goal.scorer && goal.scorer.name) || '';
+  const surname = name.trim().split(/\s+/).pop().toUpperCase();
+  let label = surname + ' ' + goal.minute;
+  if (goal.injuryTime) label += '+' + goal.injuryTime;
+  if (goal.type === 'PENALTY') label += ' PEN';
+  else if (goal.type === 'OWN') label += ' OG';
+  return label;
+}
+
+// ---- Goals/lineup cache population ------------------------------------------
+const GOALS_WINDOW_MS = 48 * 60 * 60 * 1000;
+const LINEUP_WINDOW_MS = 2 * 60 * 60 * 1000;
+
+function needsGoals(m) {
+  if (m.status === 'IN_PLAY' || m.status === 'PAUSED') return true;
+  if (m.status !== 'FINISHED') return false;
+  return (Date.now() - new Date(m.utcDate).getTime()) < GOALS_WINDOW_MS;
+}
+
+function needsLineup(m) {
+  if (lineupCache.has(m.id) && m.status === 'FINISHED') return false;
+  if (m.status === 'IN_PLAY' || m.status === 'PAUSED' || m.status === 'FINISHED') return true;
+  if (m.status !== 'TIMED' && m.status !== 'SCHEDULED') return false;
+  return (new Date(m.utcDate).getTime() - Date.now()) < LINEUP_WINDOW_MS;
+}
+
+function extractLineup(teamData) {
+  if (!teamData) return null;
+  return {
+    formation: teamData.formation || null,
+    lineup: (teamData.lineup || []).map(p => ({ shirt: p.shirtNumber, name: p.name, pos: p.position })),
+    bench:  (teamData.bench  || []).map(p => ({ shirt: p.shirtNumber, name: p.name, pos: p.position })),
+    coach: (teamData.coach && teamData.coach.name) || null,
+  };
+}
+
+async function populateGoalsCache(rawMatches) {
+  const delay = ms => new Promise(r => setTimeout(r, ms));
+  for (const m of rawMatches) {
+    const wantsGoals  = needsGoals(m);
+    const wantsLineup = needsLineup(m);
+    if (!wantsGoals && !wantsLineup) continue;
+
+    const isLive     = m.status === 'IN_PLAY' || m.status === 'PAUSED';
+    const isTimed    = m.status === 'TIMED' || m.status === 'SCHEDULED';
+    const isFinished = m.status === 'FINISHED';
+
+    const cachedGoals  = goalsCache.get(m.id);
+    const cachedLineup = lineupCache.get(m.id);
+    const lineupEmpty  = !cachedLineup || !cachedLineup.home || !cachedLineup.home.lineup || cachedLineup.home.lineup.length === 0;
+
+    if (isFinished && cachedGoals && cachedGoals.length > 0 && !lineupEmpty) continue;
+    if (isFinished && !wantsLineup && cachedGoals && cachedGoals.length > 0) continue;
+    if (!isLive && isTimed && !wantsGoals && !lineupEmpty) continue;
+
+    try {
+      const detail = await fetchFD(`/matches/${m.id}`);
+      if (wantsGoals) goalsCache.set(m.id, detail.goals || []);
+      const home = extractLineup(detail.homeTeam);
+      const away = extractLineup(detail.awayTeam);
+      const homeHasPlayers = home && home.lineup && home.lineup.length > 0;
+      if (homeHasPlayers) {
+        lineupCache.set(m.id, { home, away });
+      } else if (!isTimed) {
+        if (!lineupCache.has(m.id)) lineupCache.set(m.id, { home, away });
+      }
+      await delay(300);
+    } catch (e) {
+      console.error('detail fetch failed for match', m.id, ':', e.message);
+    }
+  }
+}
+
+// ---- Match mapping ----------------------------------------------------------
+// WC bracket lookup (match IDs mapped to slot descriptions)
 const BRACKET = {
-  // Round of 32
   537417: { home: 'Runner-up A',  away: 'Runner-up B' },
   537423: { home: 'Winner E',     away: 'Best 3rd (A/B/C/D/F)' },
   537415: { home: 'Winner F',     away: 'Runner-up C' },
@@ -72,171 +161,10 @@ const BRACKET = {
   537428: { home: 'Winner J',     away: 'Runner-up H' },
   537427: { home: 'Winner K',     away: 'Best 3rd (D/E/I/J/L)' },
   537430: { home: 'Runner-up D',  away: 'Runner-up G' },
-  // Round of 16 (winners of R32 matches, in bracket order)
-  537376: { home: 'Winner M74',   away: 'Winner M77' },
-  537375: { home: 'Winner M73',   away: 'Winner M75' },
-  537377: { home: 'Winner M76',   away: 'Winner M78' },
-  537378: { home: 'Winner M79',   away: 'Winner M80' },
-  537379: { home: 'Winner M83',   away: 'Winner M84' },
-  537380: { home: 'Winner M81',   away: 'Winner M82' },
-  537381: { home: 'Winner M85',   away: 'Winner M87' },
-  537382: { home: 'Winner M86',   away: 'Winner M88' },
-  // Quarter-finals
-  537383: { home: 'QF1: R16 winners', away: 'QF1: R16 winners' },
-  537384: { home: 'QF2: R16 winners', away: 'QF2: R16 winners' },
-  537385: { home: 'QF3: R16 winners', away: 'QF3: R16 winners' },
-  537386: { home: 'QF4: R16 winners', away: 'QF4: R16 winners' },
-  // Semi-finals
-  537387: { home: 'SF1: QF winners',  away: 'SF1: QF winners' },
-  537388: { home: 'SF2: QF winners',  away: 'SF2: QF winners' },
-  // Third place & Final
-  537389: { home: 'Semi-final losers', away: 'Semi-final losers' },
-  537390: { home: 'SF1 winner',        away: 'SF2 winner' },
 };
-
-async function fetchFD(path) {
-  const apiRes = await fetch(BASE + path, { headers: {
-    'X-Auth-Token': API_KEY || '',
-    'X-Unfold-Goals': 'true',
-    'X-Unfold-Lineups': 'true',
-    'X-Unfold-Bookings': 'true',
-    'X-Unfold-Subs': 'true',
-  }});
-  if (!apiRes.ok) throw new Error(path + ' -> HTTP ' + apiRes.status);
-  return apiRes.json();
-}
-
-// matches use "GROUP_C", standings use "Group C" — same tournament, two formats.
-// Both map to a bare letter "C"; anything else (knockout stages) -> null
-function groupLetter(g) {
-  if (!g) return null;
-  const m = /GROUP[_\s]?([A-Za-z])$/i.exec(g);
-  return m ? m[1].toUpperCase() : null;
-}
-
-// Per-match lineup data, from the same /matches/{id} detail call as goals.
-// Keyed by match id. Stores { home, away } each with { formation, lineup, bench, coach }.
-const lineupCache = new Map();
-
-// Goals only need fetching for matches that have actually started, and only
-// for a recent window - the dataset now spans the whole tournament, and we
-// don't want the first refresh after deploy to fire ~20+ goal-detail
-// requests for long-finished matches nobody's looking at. 48h covers
-// "today/yesterday" for any timezone; live matches are always included
-// regardless of age (covers a match running past midnight).
-const GOALS_WINDOW_MS = 48 * 60 * 60 * 1000;
-function needsGoals(m) {
-  if (m.status === 'IN_PLAY' || m.status === 'PAUSED') return true;
-  if (m.status !== 'FINISHED') return false;
-  return (Date.now() - new Date(m.utcDate).getTime()) < GOALS_WINDOW_MS;
-}
-
-// Lineups drop ~1hr before kickoff. Fetch for any upcoming match within
-// 2hrs of kickoff, plus all started matches (they'll already be fetched
-// for goals — this just also extracts the lineup from the same call).
-const LINEUP_WINDOW_MS = 2 * 60 * 60 * 1000;
-function needsLineup(m) {
-  if (lineupCache.has(m.id) && m.status === 'FINISHED') return false; // cache forever when done
-  if (m.status === 'IN_PLAY' || m.status === 'PAUSED' || m.status === 'FINISHED') return true;
-  if (m.status !== 'TIMED' && m.status !== 'SCHEDULED') return false;
-  return (new Date(m.utcDate).getTime() - Date.now()) < LINEUP_WINDOW_MS;
-}
-
-function extractLineup(teamData) {
-  if (!teamData) return null;
-  return {
-    formation: teamData.formation || null,
-    lineup: (teamData.lineup || []).map(p => ({
-      shirt: p.shirtNumber,
-      name: p.name,
-      pos: p.position,
-    })),
-    bench: (teamData.bench || []).map(p => ({
-      shirt: p.shirtNumber,
-      name: p.name,
-      pos: p.position,
-    })),
-    coach: (teamData.coach && teamData.coach.name) || null,
-  };
-}
-
-// "SURNAME 90" / "SURNAME 90+6" / "SURNAME 67 PEN" / "SURNAME 23 OG" -
-// matches the mock data's "MCTOMINAY 57" style. Surname = last word of the
-// scorer's full name (an approximation - misses multi-word surnames like
-// "van Dijk", but fits the compact teletext format much better than full names).
-function formatScorer(goal) {
-  const name = (goal.scorer && goal.scorer.name) || '';
-  const surname = name.trim().split(/\s+/).pop().toUpperCase();
-  let label = surname + ' ' + goal.minute;
-  if (goal.injuryTime) label += '+' + goal.injuryTime;
-  if (goal.type === 'PENALTY') label += ' PEN';
-  else if (goal.type === 'OWN') label += ' OG';
-  return label;
-}
-
-// Populates goalsCache and lineupCache for matches that need it.
-// Key rules:
-// - FINISHED matches: fetch once, cache forever — but ONLY on success.
-//   A failed/rate-limited fetch must NOT be cached as empty, or we'll
-//   never retry and scorers will be permanently missing.
-// - IN_PLAY/PAUSED: always re-fetch (score/scorers changing)
-// - TIMED: re-fetch if cached lineup is empty (lineups drop ~1hr before KO)
-// - Rate limiting: small delay between calls to avoid hitting football-data.org limits
-async function populateGoalsCache(rawMatches) {
-  const delay = ms => new Promise(r => setTimeout(r, ms));
-
-  for (const m of rawMatches) {
-    const wantsGoals = needsGoals(m);
-    const wantsLineup = needsLineup(m);
-    if (!wantsGoals && !wantsLineup) continue;
-
-    const isLive = m.status === 'IN_PLAY' || m.status === 'PAUSED';
-    const isTimed = m.status === 'TIMED' || m.status === 'SCHEDULED';
-    const isFinished = m.status === 'FINISHED';
-
-    const cachedGoals = goalsCache.get(m.id);
-    const cachedLineup = lineupCache.get(m.id);
-    const lineupIsEmpty = !cachedLineup || !cachedLineup.home || !cachedLineup.home.lineup || cachedLineup.home.lineup.length === 0;
-
-    // For FINISHED matches: skip only if we have BOTH goals and lineup cached.
-    // If goals cache exists but is empty, it could be an error result — retry.
-    // (Live matches always re-fetch; TIMED re-fetch until lineup populated.)
-    if (isFinished && cachedGoals && cachedGoals.length > 0 && !lineupIsEmpty) continue;
-    if (isFinished && !wantsLineup && cachedGoals && cachedGoals.length > 0) continue;
-    if (!isLive && isTimed && !wantsGoals && !lineupIsEmpty) continue;
-
-    try {
-      const detail = await fetchFD(`/matches/${m.id}`);
-      const goals = detail.goals || [];
-      if (wantsGoals) {
-        // Only cache if we got a real response — empty goals on a FINISHED
-        // match with a non-zero score is suspicious; cache anyway but it'll
-        // be retried next cycle since goals.length === 0.
-        goalsCache.set(m.id, goals);
-      }
-      const home = extractLineup(detail.homeTeam);
-      const away = extractLineup(detail.awayTeam);
-      const homeHasPlayers = home && home.lineup && home.lineup.length > 0;
-      if (homeHasPlayers) {
-        lineupCache.set(m.id, { home, away });
-      } else if (!isTimed) {
-        if (!lineupCache.has(m.id)) lineupCache.set(m.id, { home, away });
-      }
-      // Small delay between calls — keeps us well inside the 30 req/min
-      // rate limit on Deep Data tier even with a full tournament dataset.
-      await delay(300);
-    } catch (e) {
-      // Do NOT cache on error — leave the entry absent so we retry next cycle.
-      console.error('detail fetch failed for match', m.id, ':', e.message);
-    }
-  }
-}
-
 
 function mapMatch(m) {
   const ft = (m.score && m.score.fullTime) || {};
-  // football-data.org has used both {home,away} and {homeTeam,awayTeam} keys
-  // depending on endpoint/competition — accept either.
   const hs = ft.home ?? ft.homeTeam ?? 0;
   const as = ft.away ?? ft.awayTeam ?? 0;
 
@@ -247,9 +175,6 @@ function mapMatch(m) {
   for (const g of goals) {
     if (!g.team) continue;
     const label = formatScorer(g);
-    // goal.team is always the SCORER's own team. For a regular/penalty goal
-    // that's also the team it counts for - but an own goal counts for the
-    // OPPONENT, so flip which column it lands in.
     let creditId = g.team.id;
     if (g.type === 'OWN') {
       if (creditId === homeId) creditId = awayId;
@@ -260,7 +185,6 @@ function mapMatch(m) {
   }
 
   const lineups = lineupCache.get(m.id) || null;
-
   const bracket = BRACKET[m.id];
   const homeName = (m.homeTeam && m.homeTeam.name) || (bracket && bracket.home) || 'TBD';
   const awayName = (m.awayTeam && m.awayTeam.name) || (bracket && bracket.away) || 'TBD';
@@ -279,188 +203,195 @@ function mapMatch(m) {
   };
 }
 
-function mapStandings(data) {
+function groupLetter(g) {
+  if (!g) return null;
+  const m = /GROUP[_\s]?([A-Za-z])$/i.exec(g);
+  return m ? m[1].toUpperCase() : null;
+}
+
+// ---- Standings mapping ------------------------------------------------------
+// Handles both grouped (tournament) and single-table (league) standings.
+function mapStandings(data, type) {
   const out = [];
   (data.standings || []).forEach(grp => {
-    const g = groupLetter(grp.group);
-    if (!g) return; // skip non-group (e.g. knockout) standings blocks
-    (grp.table || []).forEach(row => {
-      const gd = row.goalDifference ?? 0;
-      out.push({
-        group: g,
-        name: (row.team && row.team.name || '').toUpperCase(),
-        p: row.playedGames ?? 0,
-        gd: (gd >= 0 ? '+' : '') + gd,
-        pts: row.points ?? 0
+    if (type === 'league') {
+      // League: single TOTAL table, no group letter needed
+      if (grp.type && grp.type !== 'TOTAL') return;
+      (grp.table || []).forEach(row => {
+        const gd = row.goalDifference ?? 0;
+        out.push({
+          group: null, // no groups in a league
+          pos: row.position,
+          name: (row.team && row.team.name || '').toUpperCase(),
+          p:  row.playedGames ?? 0,
+          w:  row.won ?? 0,
+          d:  row.draw ?? 0,
+          l:  row.lost ?? 0,
+          gd: (gd >= 0 ? '+' : '') + gd,
+          pts: row.points ?? 0,
+          form: row.form || null,
+        });
       });
-    });
+    } else {
+      // Tournament: grouped table
+      const g = groupLetter(grp.group);
+      if (!g) return;
+      (grp.table || []).forEach(row => {
+        const gd = row.goalDifference ?? 0;
+        out.push({
+          group: g,
+          name: (row.team && row.team.name || '').toUpperCase(),
+          p: row.playedGames ?? 0,
+          gd: (gd >= 0 ? '+' : '') + gd,
+          pts: row.points ?? 0,
+        });
+      });
+    }
   });
   return out;
 }
 
-function pickSubtitle(matches) {
+// ---- Subtitle ---------------------------------------------------------------
+const STAGE_LABELS = {
+  GROUP_STAGE: 'GROUP STAGE', LAST_32: 'ROUND OF 32', LAST_16: 'ROUND OF 16',
+  QUARTER_FINALS: 'QUARTER-FINALS', SEMI_FINALS: 'SEMI-FINALS',
+  THIRD_PLACE: 'THIRD PLACE PLAY-OFF', FINAL: 'FINAL',
+  REGULAR_SEASON: 'REGULAR SEASON', PLAYOFFS: 'PLAY-OFFS',
+};
+
+function pickSubtitle(matches, compCode) {
+  const cfg = COMPETITIONS[compCode] || {};
+  if (cfg.type === 'league') return cfg.label || compCode;
   const live = matches.find(m => m.stage && (m.status === 'IN_PLAY' || m.status === 'PAUSED'));
   const stage = (live || matches[0] || {}).stage;
-  return STAGE_LABELS[stage] || 'WORLD CUP';
+  return STAGE_LABELS[stage] || cfg.label || compCode;
 }
 
-async function refresh() {
-  let matches = cache.matches, table = cache.table, subtitle = cache.subtitle, fetchedAt = cache.fetchedAt;
+// ---- Per-competition refresh ------------------------------------------------
+async function refreshComp(code) {
+  const cfg = COMPETITIONS[code] || { name: code, label: code, type: 'league' };
+  let { matches, table, subtitle, fetchedAt } = compCache[code];
 
   try {
-    // No date filter: fetch the whole competition's matches (one season,
-    // ~104 for the World Cup). This lets the frontend group by the
-    // *viewer's local* calendar day and navigate between days — a
-    // server-side "today" filter can't do that correctly across timezones
-    // (a 23:00 UTC kickoff is already "tomorrow" in BST).
-    const data = await fetchFD(`/competitions/${COMPETITION}/matches`);
+    const data = await fetchFD(`/competitions/${code}/matches`);
     const t0 = Date.now();
     await populateGoalsCache(data.matches || []);
-    console.log(`populateGoalsCache: ${Date.now()-t0}ms for ${(data.matches||[]).length} raw matches`);
+    console.log(`[${code}] populateGoalsCache: ${Date.now()-t0}ms for ${(data.matches||[]).length} matches`);
     matches = (data.matches || []).map(mapMatch);
-    subtitle = pickSubtitle(matches);
+    subtitle = pickSubtitle(matches, code);
     fetchedAt = new Date().toISOString();
-    debugInfo.lastError.matches = null;
-    // raw snapshot of just the bits we care about, for diagnosing score/minute mapping
-    debugInfo.rawMatches = (data.matches || []).map(m => ({
-      id: m.id,
-      home: m.homeTeam && m.homeTeam.name,
-      away: m.awayTeam && m.awayTeam.name,
-      status: m.status,
-      minute: m.minute,
-      score: m.score,
-      group: m.group,
-      stage: m.stage,
-      utcDate: m.utcDate
+    debugInfo.lastError[code + '_matches'] = null;
+    debugInfo.rawMatches[code] = (data.matches || []).map(m => ({
+      id: m.id, home: m.homeTeam && m.homeTeam.name, away: m.awayTeam && m.awayTeam.name,
+      status: m.status, minute: m.minute, score: m.score, group: m.group,
+      stage: m.stage, utcDate: m.utcDate,
     }));
   } catch (e) {
-    debugInfo.lastError.matches = e.message;
-    console.error('matches refresh failed:', e.message);
+    debugInfo.lastError[code + '_matches'] = e.message;
+    console.error(`[${code}] matches refresh failed:`, e.message);
   }
 
   try {
-    const data = await fetchFD(`/competitions/${COMPETITION}/standings`);
-    table = mapStandings(data);
-    debugInfo.lastError.standings = null;
-    debugInfo.rawStandings = data;
+    const data = await fetchFD(`/competitions/${code}/standings`);
+    table = mapStandings(data, cfg.type);
+    debugInfo.lastError[code + '_standings'] = null;
   } catch (e) {
-    // Standings can 404 once the group stage ends — not fatal, keep last-known table.
-    debugInfo.lastError.standings = e.message;
-    console.error('standings refresh failed:', e.message);
+    debugInfo.lastError[code + '_standings'] = e.message;
+    console.error(`[${code}] standings refresh failed:`, e.message);
   }
 
+  compCache[code] = { competition: cfg.name, subtitle, matches, table, fetchedAt };
+  console.log(`[${code}] refreshed: ${matches.length} matches, ${table.length} table rows`);
+
+  if (!compFirstDone[code]) {
+    compFirstDone[code] = true;
+    const pending = compPending[code] || [];
+    pending.forEach(({ res, timeout }) => { clearTimeout(timeout); res.json(compCache[code]); });
+    compPending[code] = [];
+  }
+}
+
+async function refreshAll() {
   debugInfo.fetchedAt = new Date().toISOString();
-
-  cache = { competition: 'WORLD CUP', subtitle, matches, table, fetchedAt };
-  console.log(new Date().toISOString(), '- refreshed:', matches.length, 'matches,', table.length, 'table rows');
-  if (!firstRefreshDone) resolvePendingFeed();
+  // Refresh competitions sequentially to avoid hammering the API
+  for (const code of Object.keys(COMPETITIONS)) {
+    await refreshComp(code);
+  }
 }
 
+// ---- Express ----------------------------------------------------------------
 const app = express();
-app.use(cors()); // public read-only feed — safe to allow any origin
-
-// Block /feed until the first refresh() has fully completed (including
-// populateGoalsCache). Without this, a frontend request that lands during
-// Render's boot gets an empty cache — matches with no scorers/lineups.
-let firstRefreshDone = false;
-const pendingFeedRequests = [];
-
-function resolvePendingFeed() {
-  firstRefreshDone = true;
-  pendingFeedRequests.forEach(({ res }) => res.json(cache));
-  pendingFeedRequests.length = 0;
-}
+app.use(cors());
 
 app.get('/feed', (req, res) => {
-  if (firstRefreshDone) return res.json(cache);
-  // First refresh still in flight — hold the request (max 45s, then serve
-  // whatever partial cache we have rather than letting it hang forever).
+  const code = (req.query.comp || DEFAULT_COMP).toUpperCase();
+  if (!COMPETITIONS[code]) return res.status(400).json({ error: `Unknown competition: ${code}` });
+
+  if (compFirstDone[code]) return res.json(compCache[code]);
+
+  // First refresh still in flight — hold the request (max 45s)
   const timeout = setTimeout(() => {
-    const idx = pendingFeedRequests.findIndex(r => r.res === res);
-    if (idx !== -1) { pendingFeedRequests.splice(idx, 1); res.json(cache); }
+    const arr = compPending[code] || [];
+    const idx = arr.findIndex(r => r.res === res);
+    if (idx !== -1) { arr.splice(idx, 1); res.json(compCache[code]); }
   }, 45000);
-  pendingFeedRequests.push({ res, timeout });
+  (compPending[code] = compPending[code] || []).push({ res, timeout });
 });
+
+// List all available competitions
+app.get('/competitions', (req, res) => {
+  res.json(Object.entries(COMPETITIONS).map(([code, cfg]) => ({
+    code, name: cfg.name, type: cfg.type,
+    fetchedAt: (compCache[code] || {}).fetchedAt || null,
+  })));
+});
+
 app.get('/debug', (req, res) => res.json(debugInfo));
 
-// Returns all knockout fixtures (LAST_32, LAST_16, QUARTER_FINALS etc) with
-// their IDs and utcDate — lets us map football-data.org match IDs to the
-// known FIFA bracket slots by cross-referencing kickoff dates/times.
 app.get('/debug/knockout', (req, res) => {
   const knockoutStages = ['LAST_32','LAST_16','QUARTER_FINALS','SEMI_FINALS','THIRD_PLACE','FINAL'];
-  const raw = debugInfo.rawMatches || [];
-  const matches = raw
+  const raw = (debugInfo.rawMatches['WC'] || [])
     .filter(m => knockoutStages.includes(m.stage))
-    .map(m => ({
-      id: m.id,
-      stage: m.stage,
-      utcDate: m.utcDate || null,
-      home: (m.homeTeam && m.homeTeam.name) || null,
-      away: (m.awayTeam && m.awayTeam.name) || null,
-      status: m.status
-    }))
-    .sort((a,b) => {
-      if(a.utcDate && b.utcDate) return new Date(a.utcDate) - new Date(b.utcDate);
-      return a.id - b.id;
-    });
-  res.json(matches);
+    .map(m => ({ id: m.id, stage: m.stage, utcDate: m.utcDate || null,
+      home: m.home || null, away: m.away || null, status: m.status }))
+    .sort((a,b) => a.utcDate && b.utcDate ? new Date(a.utcDate)-new Date(b.utcDate) : a.id-b.id);
+  res.json(raw);
 });
 
-// On-demand: fetch one match's full detail (not part of the regular 60s
-// poll, so it doesn't affect rate limits). Use this to check whether `goals`
-// (scorer + minute) is present on this API key's tier.
-//   GET /debug/match?id=<id from /debug rawMatches>
 app.get('/debug/match', async (req, res) => {
   const id = req.query.id;
-  if (!id) return res.status(400).json({ error: 'pass ?id=<match id from /debug rawMatches>' });
+  if (!id) return res.status(400).json({ error: 'pass ?id=<match id>' });
   try {
     const data = await fetchFD(`/matches/${id}`);
-    res.json({
-      id: data.id,
-      status: data.status,
-      score: data.score,
-      goals: data.goals,
-      homeTeam: data.homeTeam && data.homeTeam.name,
-      awayTeam: data.awayTeam && data.awayTeam.name
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+    res.json({ id: data.id, status: data.status, score: data.score, goals: data.goals,
+      homeTeam: data.homeTeam && data.homeTeam.name, awayTeam: data.awayTeam && data.awayTeam.name });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// On-demand: fetch one match's lineup/formation data to verify shape.
-//   GET /debug/lineup?id=<match id>
 app.get('/debug/lineup', async (req, res) => {
   const id = req.query.id;
   if (!id) return res.status(400).json({ error: 'pass ?id=<match id>' });
   try {
     const data = await fetchFD(`/matches/${id}`);
     res.json({
-      id: data.id,
-      status: data.status,
-      homeTeam: {
-        name: data.homeTeam && data.homeTeam.name,
+      id: data.id, status: data.status,
+      homeTeam: { name: data.homeTeam && data.homeTeam.name,
         formation: data.homeTeam && data.homeTeam.formation,
         lineup: data.homeTeam && data.homeTeam.lineup,
         bench: data.homeTeam && data.homeTeam.bench,
-        coach: data.homeTeam && data.homeTeam.coach,
-      },
-      awayTeam: {
-        name: data.awayTeam && data.awayTeam.name,
+        coach: data.homeTeam && data.homeTeam.coach },
+      awayTeam: { name: data.awayTeam && data.awayTeam.name,
         formation: data.awayTeam && data.awayTeam.formation,
         lineup: data.awayTeam && data.awayTeam.lineup,
         bench: data.awayTeam && data.awayTeam.bench,
-        coach: data.awayTeam && data.awayTeam.coach,
-      }
+        coach: data.awayTeam && data.awayTeam.coach },
     });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (req, res) => res.send('Page 302 backend is running. Try /feed or /debug'));
+app.get('/', (req, res) => res.send('Page 302 backend. Try /feed?comp=ELC or /competitions'));
 
-refresh(); // populate cache immediately on boot
-setInterval(refresh, 60_000); // football-data.org free tier allows far more than 1 req/min
+refreshAll();
+setInterval(refreshAll, 60_000);
 
-app.listen(PORT, () => console.log('Page 302 backend listening on port ' + PORT));
+app.listen(PORT, () => console.log(`Page 302 backend listening on port ${PORT} (default comp: ${DEFAULT_COMP})`));
