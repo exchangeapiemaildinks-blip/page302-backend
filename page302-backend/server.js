@@ -24,13 +24,14 @@ if (!API_KEY) {
 }
 
 // ---- Competition config ------------------------------------------------------
-// All supported competitions. Add more here as needed.
+// Only include competitions that are actually active/subscribed.
+// Add/remove here as seasons start and end — inactive ones waste API quota.
 const COMPETITIONS = {
-  ELC: { name: 'CHAMPIONSHIP',    label: 'CHAMPIONSHIP',    type: 'league'      },
-  PL:  { name: 'PREMIER LEAGUE',  label: 'PREMIER LEAGUE',  type: 'league'      },
-  WC:  { name: 'WORLD CUP',       label: 'WORLD CUP',       type: 'tournament'  },
-  CL:  { name: 'CHAMPIONS LEAGUE',label: 'CHAMPIONS LEAGUE',type: 'league'      },
-  EC:  { name: 'EUROS',           label: 'EUROS',            type: 'tournament'  },
+  ELC: { name: 'CHAMPIONSHIP',    label: 'CHAMPIONSHIP',    type: 'league'  },
+  PL:  { name: 'PREMIER LEAGUE',  label: 'PREMIER LEAGUE',  type: 'league'  },
+  // Add WC/CL/EC back here when their seasons are active and subscribed:
+  // WC:  { name: 'WORLD CUP',    label: 'WORLD CUP',    type: 'tournament' },
+  // CL:  { name: 'CHAMPIONS LEAGUE', label: 'CHAMPIONS LEAGUE', type: 'league' },
 };
 
 // ---- Per-competition cache ---------------------------------------------------
@@ -79,8 +80,19 @@ function formatScorer(goal) {
 }
 
 // ---- Goals/lineup cache population ------------------------------------------
-const GOALS_WINDOW_MS = 48 * 60 * 60 * 1000;
+// Tighter window — 24h covers yesterday + today which is all users actually need.
+// 48h was doubling the number of detail fetches unnecessarily.
+const GOALS_WINDOW_MS = 24 * 60 * 60 * 1000;
 const LINEUP_WINDOW_MS = 2 * 60 * 60 * 1000;
+
+// Rate limit budget:
+// 30 req/min = 1 req per 2 seconds.
+// We have 2 comps × 2 base calls = 4 base calls per cycle.
+// Remaining budget for detail calls: 26/min across the full 60s cycle.
+// 2.5s delay between detail calls = max 24 detail calls per comp refresh.
+// With 2 comps refreshed alternately (ELC at 0s, PL at 30s), each gets
+// ~24 detail call slots without overlapping — well within limits.
+const DETAIL_CALL_DELAY_MS = 2500;
 
 function needsGoals(m) {
   if (m.status === 'IN_PLAY' || m.status === 'PAUSED') return true;
@@ -107,7 +119,16 @@ function extractLineup(teamData) {
 
 async function populateGoalsCache(rawMatches) {
   const delay = ms => new Promise(r => setTimeout(r, ms));
+  // Hard cap: never make more than 20 detail calls per refresh cycle.
+  // At 2.5s each that's 50s of calls — leaves headroom for base calls.
+  const MAX_DETAIL_CALLS = 20;
+  let detailCallCount = 0;
+
   for (const m of rawMatches) {
+    if (detailCallCount >= MAX_DETAIL_CALLS) {
+      console.warn(`[detail] hit cap of ${MAX_DETAIL_CALLS} calls, skipping remaining matches this cycle`);
+      break;
+    }
     const wantsGoals  = needsGoals(m);
     const wantsLineup = needsLineup(m);
     if (!wantsGoals && !wantsLineup) continue;
@@ -125,6 +146,7 @@ async function populateGoalsCache(rawMatches) {
     if (!isLive && isTimed && !wantsGoals && !lineupEmpty) continue;
 
     try {
+      detailCallCount++;
       const detail = await fetchFD(`/matches/${m.id}`);
       if (wantsGoals) goalsCache.set(m.id, detail.goals || []);
       const home = extractLineup(detail.homeTeam);
@@ -135,7 +157,7 @@ async function populateGoalsCache(rawMatches) {
       } else if (!isTimed) {
         if (!lineupCache.has(m.id)) lineupCache.set(m.id, { home, away });
       }
-      await delay(300);
+      await delay(DETAIL_CALL_DELAY_MS);
     } catch (e) {
       console.error('detail fetch failed for match', m.id, ':', e.message);
     }
@@ -313,9 +335,13 @@ async function refreshComp(code) {
 
 async function refreshAll() {
   debugInfo.fetchedAt = new Date().toISOString();
-  // Refresh competitions sequentially to avoid hammering the API
-  for (const code of Object.keys(COMPETITIONS)) {
-    await refreshComp(code);
+  const codes = Object.keys(COMPETITIONS);
+  // Stagger competitions evenly across the 60s cycle so their API calls
+  // don't overlap. With 2 comps and 60s interval: ELC at 0s, PL at 30s.
+  const staggerMs = codes.length > 1 ? Math.floor(60000 / codes.length) : 0;
+  for (let i = 0; i < codes.length; i++) {
+    if (i > 0) await new Promise(r => setTimeout(r, staggerMs));
+    await refreshComp(codes[i]);
   }
 }
 
