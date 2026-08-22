@@ -212,6 +212,7 @@ function mapMatch(m) {
   const awayName = (m.awayTeam && m.awayTeam.name) || (bracket && bracket.away) || 'TBD';
 
   return {
+    id: m.id,
     home: homeName.toUpperCase(),
     away: awayName.toUpperCase(),
     hs, as,
